@@ -1,0 +1,866 @@
+#!/usr/bin/env python3
+"""
+A command‐line interface (CLI) wrapper to set up, download, and process datasets
+using the coderdata package. This script creates the required folder structure,
+downloads datasets, and prepares various master tables and splits for downstream analysis.
+"""
+
+from copy import deepcopy
+import functools as ft
+import logging
+from os import PathLike
+from pathlib import Path, PurePath
+from typing import Union
+import sys
+import argparse
+
+import coderdata as cd
+import pandas as pd
+
+
+# ------------------------------------------------------------------------------
+# Global Constants
+# ------------------------------------------------------------------------------
+# Bins and labels for discretizing copy number data.
+COPY_NUMBER_BINS = [0, 0.5210507, 0.7311832, 1.214125, 1.422233, 2]
+COPY_NUMBER_LABELS = [-2, -1, 0, 1, 2]
+
+# Ratio for train/test/validate splits
+SPLIT_RATIO = (8, 1, 1)
+
+logger = logging.getLogger(__name__)
+
+
+def ensure_columns(df: pd.DataFrame, required_columns: list, context: str = ""):
+    """
+    Helper function that checks whether a DataFrame contains the required columns.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The DataFrame to check.
+    required_columns : list
+        A list of column names that must be present.
+    context : str, optional
+        A description of the DataFrame for logging purposes.
+
+    Raises
+    ------
+    KeyError
+        If one or more of the required columns is missing.
+    """
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        raise KeyError(f"Missing required columns {missing} in {context}")
+
+
+def main():
+    """
+    Main function to parse arguments and run the selected workflow command.
+    """
+    main_parser = argparse.ArgumentParser(
+        description="Wrapper for dataset setup, download, and processing."
+    )
+
+    command_parsers = main_parser.add_subparsers(
+        dest="command",
+        title="commands",
+        required=True,
+    )
+
+    # Shared arguments for all sub-commands
+    p_shared_args = argparse.ArgumentParser(add_help=False)
+    p_shared_args.add_argument(
+        '-w', '--work_dir',
+        dest='WORKDIR',
+        type=_check_folder,
+        default=Path.cwd(),
+        help="Working directory (must exist)"
+    )
+    p_shared_args.add_argument(
+        '--overwrite',
+        dest='OVERWRITE',
+        action='store_true',
+        help="Overwrite existing files and folders if necessary."
+    )
+    p_shared_args.add_argument(
+        '-v', '--verbose',
+        dest='LOGLEVEL',
+        choices=['warn', 'info', 'debug'],
+        default='warn',
+        help='Defines verbosity level of logging'
+    )
+
+    # Setup workflow command
+    p_setup_workflow = command_parsers.add_parser(
+        "setup",
+        parents=[p_shared_args],
+        help="Create the folder structure for the workflow."
+    )
+    p_setup_workflow.set_defaults(func=setup_workflow)
+
+    # Download datasets command
+    p_download_datasets = command_parsers.add_parser(
+        "download",
+        parents=[p_shared_args],
+        help="Download all required datasets."
+    )
+    p_download_datasets.set_defaults(func=download_datasets)
+
+    # Process datasets command
+    p_process_datasets = command_parsers.add_parser(
+        "process",
+        parents=[p_shared_args],
+        help="Process datasets, create master tables and data splits."
+    )
+    p_process_datasets.set_defaults(func=process_datasets)
+    p_process_datasets.add_argument(
+        '-s', '--split_type', dest="SPLIT_TYPE",
+        type=str,
+        choices=['mixed-set', 'drug-blind', 'cancer-blind'],
+        default='mixed-set',
+        help="Type of split to generate."
+    )
+    p_process_datasets.add_argument(
+        '-n', '--num_splits', dest='NUM_SPLITS',
+        type=int,
+        default=10,
+        help="Number of splits to generate."
+    )
+    p_process_datasets.add_argument(
+        '-r', '--random_seeds', dest='RANDOM_SEEDS',
+        type=_random_seed_list,
+        default=None,
+        help="Comma-separated list of rand seeds. Must have same length as NUM_SPLITS. If omitted, rand seeds are used."
+    )
+
+    # All workflow command
+    p_all = command_parsers.add_parser(
+        "all",
+        parents=[p_shared_args],
+        help="Run setup, download, and process steps in sequence."
+    )
+    p_all.set_defaults(func=full_workflow)
+
+    if len(sys.argv) == 1:
+        main_parser.print_help(sys.stderr)
+        sys.exit(0)
+    try:
+        args = main_parser.parse_args()
+    except (FileNotFoundError, ValueError) as e:
+        sys.exit(e)
+
+    # Set logging level based on argument
+    if args.LOGLEVEL == 'info':
+        loglevel = logging.INFO
+    elif args.LOGLEVEL == 'debug':
+        loglevel = logging.DEBUG
+    else:
+        loglevel = logging.WARNING
+
+    logging.basicConfig(
+        format="{asctime} - {levelname} - {message}",
+        style="{",
+        datefmt="%Y-%m-%d %H:%M",
+        level=loglevel
+    )
+    args.func(args)
+
+
+def full_workflow(args):
+    """
+    Run the full workflow: setup, download, then process.
+    """
+    setup_workflow(args)
+    download_datasets(args)
+    process_datasets(args)
+
+
+def process_datasets(args):
+    """
+    Process the downloaded datasets:
+    - Create drug response file.
+    - Generate splits.
+    - Merge and process transcriptomics and copy number data.
+    - Generate SMILES and mutation count tables.
+    """
+    if args.RANDOM_SEEDS is not None and len(args.RANDOM_SEEDS) != args.NUM_SPLITS:
+        sys.exit(
+            "<RANDOM_SEEDS> must contain the same number of random seed values as <NUM_SPLITS>."
+        )
+
+    local_path = args.WORKDIR.joinpath('data_in_tmp')
+
+    # Retrieve available dataset information.
+    data_sets_info = cd.list_datasets(raw=True)
+
+    # Import all available datasets into a dict (keyed by dataset name)
+    logger.info("Importing datasets...")
+    data_sets = {}
+    for data_set in data_sets_info.keys():
+        data_sets[data_set] = cd.load(name=data_set, local_path=local_path)
+    logger.info("Importing datasets... done")
+
+    # -------------------------------------------------------------------
+    # Concatenate all experiments/responses to create response.tsv
+    # -------------------------------------------------------------------
+    experiments = []
+    logger.debug("Building list of datasets that contain experiment info ...")
+    for data_set in data_sets_info.keys():
+        if data_sets[data_set].experiments is not None:
+            try:
+                # Attempt to format experiment data.
+                from typing import Union, List
+
+                metrics_value: Union[dict, List[str]] = [
+                    'fit_auc',
+                    'fit_ic50',
+                    'fit_r2',
+                    'fit_ec50se',
+                    'fit_einf',
+                    'fit_hs',
+                    'aac',
+                    'auc',
+                    'dss',
+                ]
+
+                experiment = data_sets[data_set].format(
+                    data_type='experiments',
+                    shape='wide',
+                    metrics=metrics_value,
+                )
+                # Ensure the required columns exist.
+                ensure_columns(experiment, ['improve_drug_id', 'improve_sample_id'],
+                               context=f"experiment data for dataset '{data_set}'")
+                experiments.append(experiment)
+            except KeyError as e:
+                logger.error(f"Dataset '{data_set}' skipped: {e}")
+        else:
+            logger.debug(f"NO experiment data for {data_set}")
+
+    if not experiments:
+        logger.error("No experiment data found in any datasets. Cannot proceed with processing.")
+        sys.exit("No experiment data found in any datasets.")
+
+    logger.debug("Concatenating experiment data ...")
+    try:
+        response_data = pd.concat(experiments, axis=0, ignore_index=True)
+    except ValueError as e:
+        logger.error("Error concatenating experiment data: " + str(e))
+        sys.exit(str(e))
+
+    # Check that the necessary columns are present.
+    try:
+        ensure_columns(response_data, ['improve_drug_id', 'improve_sample_id'], "response data")
+    except KeyError as e:
+        logger.error(e)
+        sys.exit(str(e))
+
+    # Rename columns if necessary (e.g., improve_drug_id to improve_chem_id)
+    response_data.rename(
+        columns={'improve_drug_id': 'improve_chem_id'},
+        inplace=True,
+    )
+    try:
+        response_data['improve_sample_id'] = "SAMPLE_ID_" + response_data['improve_sample_id'].astype(int).astype(str)
+    except Exception as e:
+        logger.error("Error processing 'improve_sample_id': " + str(e))
+        sys.exit(str(e))
+
+    # Export the drug response data to 'y_data/response.tsv'
+    outfile_path = args.WORKDIR.joinpath("data_out", "y_data", "response.tsv")
+    response_data.to_csv(
+        path_or_buf=outfile_path,
+        index=False,
+        sep='\t',
+    )
+    logger.info(f"Drug response data written to '{outfile_path}'")
+    # Temporary addition of an "index" column as a reference for split extraction.
+    response_data['index'] = response_data.index
+
+    # -------------------------------------------------------------------
+    # Creation of splits
+    # -------------------------------------------------------------------
+    split_data_sets(
+        args=args,
+        data_sets=data_sets,
+        data_sets_info=data_sets_info,
+        response_data=response_data
+    )
+
+    # -------------------------------------------------------------------
+    # Get common/reference gene symbols from the genes DataFrame.
+    # -------------------------------------------------------------------
+    try:
+        # Assume the first dataset has a 'genes' attribute.
+        data_gene_names = list(data_sets.values())[0].genes
+        ensure_columns(data_gene_names, ['other_id_source', 'entrez_id', 'gene_symbol'], "gene names data")
+    except (IndexError, KeyError) as e:
+        logger.error("Gene names data is missing required columns or is empty: " + str(e))
+        sys.exit(e)
+
+    data_gene_names = (
+        data_gene_names[data_gene_names['other_id_source'] == 'ensembl_gene']
+        .drop_duplicates(subset=['entrez_id', 'gene_symbol'], keep='first')
+    )
+    data_gene_names.rename(
+        columns={'other_id': 'ensembl_gene_id'},
+        inplace=True,
+    )
+    data_gene_names.drop(
+        columns=['other_id_source'], inplace=True
+    )
+    try:
+        data_gene_names['entrez_id'] = data_gene_names['entrez_id'].astype(int)
+    except Exception as e:
+        logger.error("Error converting 'entrez_id' to int in gene names data: " + str(e))
+        sys.exit(str(e))
+
+    # -------------------------------------------------------------------
+    # Create gene expression master table
+    # -------------------------------------------------------------------
+    merged_transcriptomics = merge_master_tables(
+        args=args,
+        data_sets=data_sets,
+        data_type='transcriptomics'
+    )
+
+    # Merge ensembl_gene_id & gene_symbol into the transcriptomics data.
+    merged_transcriptomics = pd.merge(
+        merged_transcriptomics,
+        data_gene_names[['entrez_id', 'ensembl_gene_id', 'gene_symbol']],
+        how='left',
+        on='entrez_id',
+    )
+
+    # Reorder columns so that ensembl_gene_id and gene_symbol appear first.
+    merged_transcriptomics.insert(
+        0,
+        'ensembl_gene_id',
+        merged_transcriptomics.pop('ensembl_gene_id')
+    )
+    merged_transcriptomics.insert(
+        1,
+        'gene_symbol',
+        merged_transcriptomics.pop('gene_symbol')
+    )
+    merged_transcriptomics = merged_transcriptomics[merged_transcriptomics['entrez_id'] != 0]
+
+    # Write the expression datatable to 'data_out/x_data/cancer_gene_expression.tsv'.
+    outfile_path = args.WORKDIR.joinpath("data_out", "x_data", "cancer_gene_expression.tsv")
+    (merged_transcriptomics
+        .fillna(0)
+        .transpose()
+        .to_csv(
+            path_or_buf=outfile_path,
+            sep='\t',
+            header=False
+        )
+    )
+
+    # -------------------------------------------------------------------
+    # Create copy number master table & discretized table
+    # -------------------------------------------------------------------
+    merged_copy_number = merge_master_tables(args, data_sets=data_sets, data_type='copy_number')
+    merged_copy_number.fillna(1, inplace=True)
+
+    discretized_copy_number = merged_copy_number.apply(
+        pd.cut,
+        bins=COPY_NUMBER_BINS,
+        labels=COPY_NUMBER_LABELS,
+        include_lowest=True
+    )
+
+    merged_copy_number = pd.merge(
+        merged_copy_number,
+        data_gene_names[['entrez_id', 'ensembl_gene_id', 'gene_symbol']],
+        how='left',
+        on='entrez_id',
+    )
+
+    merged_copy_number.insert(
+        0,
+        'ensembl_gene_id',
+        merged_copy_number.pop('ensembl_gene_id')
+    )
+    merged_copy_number.insert(
+        1,
+        'gene_symbol',
+        merged_copy_number.pop('gene_symbol')
+    )
+
+    outfile_path = args.WORKDIR.joinpath("data_out", "x_data", "cancer_copy_number.tsv")
+    (merged_copy_number
+        .transpose()
+        .to_csv(
+            path_or_buf=outfile_path,
+            sep='\t',
+            header=False
+        )
+    )
+
+    discretized_copy_number = pd.merge(
+        discretized_copy_number,
+        data_gene_names[['entrez_id', 'ensembl_gene_id', 'gene_symbol']],
+        how='left',
+        on='entrez_id',
+    )
+    discretized_copy_number.insert(
+        0,
+        'ensembl_gene_id',
+        discretized_copy_number.pop('ensembl_gene_id')
+    )
+    discretized_copy_number.insert(
+        1,
+        'gene_symbol',
+        discretized_copy_number.pop('gene_symbol')
+    )
+
+    outfile_path = args.WORKDIR.joinpath("data_out", "x_data", "cancer_discretized_copy_number.tsv")
+    (discretized_copy_number
+        .transpose()
+        .to_csv(
+            path_or_buf=outfile_path,
+            sep='\t',
+            header=False
+        )
+    )
+
+    # -------------------------------------------------------------------
+    # Create SMILES table
+    # -------------------------------------------------------------------
+    dfs_to_merge = {}
+    for data_set in data_sets:
+        if data_sets[data_set].experiments is not None and data_sets[data_set].drugs is not None:
+            try:
+                ensure_columns(data_sets[data_set].drugs, ['improve_drug_id', 'canSMILES'],
+                               context=f"drug data for dataset '{data_set}'")
+                dfs_to_merge[data_set] = deepcopy(data_sets[data_set].drugs)
+            except KeyError as e:
+                logger.error(f"Skipping drug data for dataset '{data_set}': {e}")
+    if dfs_to_merge:
+        concat_drugs = pd.concat(dfs_to_merge.values())
+        try:
+            out_df = concat_drugs[['improve_drug_id', 'canSMILES']].drop_duplicates()
+        except KeyError as e:
+            logger.error("Error selecting columns for SMILES table: " + str(e))
+            out_df = pd.DataFrame()
+        if not out_df.empty:
+            out_df.rename(
+                columns={'improve_drug_id': 'improve_chem_id'},
+                inplace=True,
+            )
+            out_df = out_df.dropna(how='any', axis=0)
+            outfile_path = args.WORKDIR.joinpath("data_out", "x_data", "drug_SMILES.tsv")
+            out_df.to_csv(
+                path_or_buf=outfile_path,
+                sep='\t',
+                index=False,
+            )
+        else:
+            logger.warning("SMILES table is empty; no valid drug data found.")
+    else:
+        logger.warning("No drug data available to create SMILES table.")
+
+    # -------------------------------------------------------------------
+    # Create mutation count table
+    # -------------------------------------------------------------------
+    dfs_to_merge = {}
+    for data_set in data_sets:
+        if data_sets[data_set].experiments is not None and data_sets[data_set].mutations is not None:
+            try:
+                ensure_columns(data_sets[data_set].mutations, ['entrez_id', 'improve_sample_id', 'mutation'],
+                               context=f"mutation data for dataset '{data_set}'")
+                dfs_to_merge[data_set] = data_sets[data_set].mutations.copy()
+                dfs_to_merge[data_set]['dataset_origin'] = data_set
+            except KeyError as e:
+                logger.error(f"Skipping mutation data for dataset '{data_set}': {e}")
+    if dfs_to_merge:
+        try:
+            merged_mutations = ft.reduce(
+                lambda left_df, right_df: pd.merge(
+                    left_df[['entrez_id', 'improve_sample_id', 'mutation', 'dataset_origin']],
+                    right_df[['entrez_id', 'improve_sample_id', 'mutation', 'dataset_origin']],
+                    on=['entrez_id', 'improve_sample_id', 'mutation', 'dataset_origin'],
+                    how='outer'
+                ),
+                list(dfs_to_merge.values())
+            )
+        except Exception as e:
+            logger.error("Error merging mutation data: " + str(e))
+            merged_mutations = pd.DataFrame()
+        if not merged_mutations.empty:
+            unique_mutations = merged_mutations[['entrez_id', 'improve_sample_id', 'mutation']].drop_duplicates()
+            unique_mutations['improve_sample_id'] = 'SAMPLE_ID_' + unique_mutations['improve_sample_id'].astype(str)
+            mutation_counts = pd.pivot_table(
+                unique_mutations,
+                values='mutation',
+                index='entrez_id',
+                columns='improve_sample_id',
+                aggfunc='count'
+            )
+            mutation_counts.fillna(0, inplace=True)
+            mutation_counts = pd.merge(
+                mutation_counts,
+                data_gene_names[['entrez_id', 'ensembl_gene_id', 'gene_symbol']],
+                how='left',
+                on='entrez_id',
+            )
+            mutation_counts.insert(
+                0,
+                'ensembl_gene_id',
+                mutation_counts.pop('ensembl_gene_id')
+            )
+            mutation_counts.insert(
+                1,
+                'gene_symbol',
+                mutation_counts.pop('gene_symbol')
+            )
+            mutation_counts = mutation_counts[mutation_counts['gene_symbol'].notna()]
+            outfile_path = args.WORKDIR.joinpath("data_out", "x_data", "cancer_mutation_count.tsv")
+            mutation_counts.T.to_csv(
+                path_or_buf=outfile_path,
+                sep='\t',
+                header=False
+            )
+        else:
+            logger.warning("Merged mutation data is empty; skipping mutation count table creation.")
+    else:
+        logger.warning("No mutation data available to create mutation count table.")
+
+
+def split_data_sets(args, data_sets, data_sets_info, response_data):
+    """
+    Create training, testing, and validation splits for each dataset that contains experiment data.
+    Writes split files to the splits folder.
+    """
+    splits_folder = args.WORKDIR.joinpath('data_out', 'splits')
+    split_type = args.SPLIT_TYPE
+    stratify_by = None
+    if args.RANDOM_SEEDS is not None:
+        random_seeds = args.RANDOM_SEEDS
+    else:
+        random_seeds = [None] * args.NUM_SPLITS
+
+    for data_set in data_sets_info.keys():
+        if data_sets[data_set].experiments is not None:
+            try:
+                ensure_columns(data_sets[data_set].experiments,
+                               ['improve_sample_id', 'improve_drug_id', "time", "study"],
+                               context=f"experiment data for dataset '{data_set}'")
+            except KeyError as e:
+                logger.error(f"Dataset '{data_set}' skipped for splitting due to missing columns: {e}")
+                continue
+
+            logger.info(f'Creating splits for {data_set} ...')
+            try:
+                drug_response_rows = (
+                    data_sets[data_set].experiments[
+                        ['improve_sample_id', 'improve_drug_id', "time", "study"]
+                    ]
+                    .drop_duplicates()
+                )
+            except Exception as e:
+                logger.error(f"Error retrieving drug response rows for dataset '{data_set}': {e}")
+                continue
+
+            drug_response_rows.rename(
+                columns={'improve_drug_id': 'improve_chem_id'},
+                inplace=True,
+            )
+            try:
+                drug_response_rows['improve_sample_id'] = "SAMPLE_ID_" + drug_response_rows['improve_sample_id'].astype(int).astype(str)
+            except Exception as e:
+                logger.error(f"Error processing sample IDs for dataset '{data_set}': {e}")
+                continue
+
+            try:
+                row_nums = pd.merge(
+                    response_data,
+                    drug_response_rows,
+                    how='inner',
+                    on=['improve_sample_id', 'improve_chem_id', "time", "study"]
+                )
+            except Exception as e:
+                logger.error(f"Error merging response data for dataset '{data_set}': {e}")
+                continue
+
+            outfile_path = splits_folder.joinpath(f"{data_set}_all.txt")
+            row_nums.to_csv(
+                path_or_buf=outfile_path,
+                columns=['index'],
+                index=False,
+                header=False
+            )
+
+            splits = {}
+            for i in range(0, args.NUM_SPLITS):
+                logger.info(f"Split #{i+1} of {args.NUM_SPLITS} for {data_set} ...")
+                try:
+                    splits[i] = data_sets[data_set].train_test_validate(
+                        split_type=split_type,
+                        ratio=SPLIT_RATIO,
+                        stratify_by=stratify_by,
+                        random_state=random_seeds[i]
+                    )
+                except Exception as e:
+                    logger.error(f"Error generating split #{i+1} for dataset '{data_set}': {e}")
+                    continue
+
+                # Training split
+                try:
+                    train_keys = (
+                        splits[i]
+                        .train
+                        .experiments[
+                            ['improve_sample_id', 'improve_drug_id', "time", "study"]
+                        ]
+                        .drop_duplicates()
+                    )
+                    train_keys.rename(
+                        columns={'improve_drug_id': 'improve_chem_id'},
+                        inplace=True,
+                    )
+                    train_keys['improve_sample_id'] = "SAMPLE_ID_" + train_keys['improve_sample_id'].astype(int).astype(str)
+                    row_nums = pd.merge(
+                        response_data,
+                        train_keys,
+                        how='inner',
+                        on=['improve_sample_id', 'improve_chem_id', "time", "study"],
+                    )
+                    outfile_path = splits_folder.joinpath(f"{data_set}_split_{i}_train.txt")
+                    row_nums.to_csv(
+                        path_or_buf=outfile_path,
+                        columns=['index'],
+                        index=False,
+                        header=False
+                    )
+                    logger.debug(f"Training split written to {outfile_path}")
+                except Exception as e:
+                    logger.error(f"Error processing training split for dataset '{data_set}' split #{i+1}: {e}")
+
+                # Testing split
+                try:
+                    test_keys = (
+                        splits[i]
+                        .test
+                        .experiments[
+                            ['improve_sample_id', 'improve_drug_id', "time", "study"]
+                        ]
+                        .drop_duplicates()
+                    )
+                    test_keys.rename(
+                        columns={'improve_drug_id': 'improve_chem_id'},
+                        inplace=True,
+                    )
+                    test_keys['improve_sample_id'] = "SAMPLE_ID_" + test_keys['improve_sample_id'].astype(int).astype(str)
+                    row_nums = pd.merge(
+                        response_data,
+                        test_keys,
+                        how='inner',
+                        on=['improve_sample_id', 'improve_chem_id', "time", "study"],
+                    )
+                    outfile_path = splits_folder.joinpath(f"{data_set}_split_{i}_test.txt")
+                    row_nums.to_csv(
+                        path_or_buf=outfile_path,
+                        columns=['index'],
+                        index=False,
+                        header=False
+                    )
+                    logger.debug(f"Testing split written to {outfile_path}")
+                except Exception as e:
+                    logger.error(f"Error processing testing split for dataset '{data_set}' split #{i+1}: {e}")
+
+                # Validation split
+                try:
+                    val_keys = (
+                        splits[i]
+                        .validate
+                        .experiments[
+                            ['improve_sample_id', 'improve_drug_id', "time", "study"]
+                        ]
+                        .drop_duplicates()
+                    )
+                    val_keys.rename(
+                        columns={'improve_drug_id': 'improve_chem_id'},
+                        inplace=True,
+                    )
+                    val_keys['improve_sample_id'] = "SAMPLE_ID_" + val_keys['improve_sample_id'].astype(int).astype(str)
+                    row_nums = pd.merge(
+                        response_data,
+                        val_keys,
+                        how='inner',
+                        on=['improve_sample_id', 'improve_chem_id', "time", "study"],
+                    )
+                    outfile_path = splits_folder.joinpath(f"{data_set}_split_{i}_val.txt")
+                    row_nums.to_csv(
+                        path_or_buf=outfile_path,
+                        columns=['index'],
+                        index=False,
+                        header=False
+                    )
+                    logger.debug(f"Validation split written to {outfile_path}")
+                except Exception as e:
+                    logger.error(f"Error processing validation split for dataset '{data_set}' split #{i+1}: {e}")
+        logger.info(f"All splits for {data_set} generated")
+
+
+def merge_master_tables(args, data_sets, data_type: str = 'transcriptomics'):
+    """
+    Helper function to merge several DataFrames into one master table.
+
+    Parameters
+    ----------
+    args : argparse.Namespace
+        Parsed command-line arguments.
+    data_sets : dict
+        Dictionary of dataset objects.
+    data_type : str, optional
+        Type of data to merge ('transcriptomics' or 'copy_number').
+
+    Returns
+    -------
+    pd.DataFrame
+        The merged master table.
+    """
+    dfs_to_merge = []
+    for data_set in data_sets:
+        if data_sets[data_set].experiments is not None:
+            if data_type in ['transcriptomics', 'copy_number'] and getattr(data_sets[data_set], data_type, None) is not None:
+                df = data_sets[data_set].format(data_type=data_type).transpose().add_prefix('SAMPLE_ID_')
+                try:
+                    ensure_columns(df, ['entrez_id'], f"formatted {data_type} data for dataset '{data_set}'")
+                    dfs_to_merge.append(df)
+                except KeyError as e:
+                    logger.error(f"Skipping dataset '{data_set}' for {data_type} due to missing columns: {e}")
+    merged_data = None
+    for df in dfs_to_merge:
+        if merged_data is None:
+            merged_data = deepcopy(df)
+        else:
+            merged_data = merged_data.merge(
+                df,
+                on='entrez_id',
+                suffixes=('', '__rm'),
+                how='outer'
+            )
+            merged_data.columns = merged_data.columns.astype(str)
+            merged_data = merged_data.loc[:, ~merged_data.columns.str.contains('__rm')]
+
+    if merged_data is not None and not merged_data.index.dtype == int:
+        merged_data.index = merged_data.index.astype(int)
+
+    return merged_data
+
+
+def download_datasets(args):
+    """
+    Download all datasets to the temporary data input folder.
+    """
+    local_path = args.WORKDIR.joinpath('data_in_tmp')
+    exist_ok = args.OVERWRITE
+    try:
+        cd.download(name='all', local_path=local_path, exist_ok=exist_ok)
+    except FileExistsError:
+        sys.exit("Data files already exist")
+
+
+def setup_workflow(args):
+    """
+    Create the folder structure for the workflow:
+
+    <WORKDIR>/
+        data_in_tmp     <- contains downloaded datasets
+        data_out/
+            splits      <- contains split files per dataset
+            x_data      <- contains combined master tables (e.g., gene expression)
+            y_data      <- contains drug response data
+    """
+    parent = args.WORKDIR
+    exist_ok = args.OVERWRITE
+
+    data_in = parent.joinpath('data_in_tmp')
+    data_out = parent.joinpath('data_out')
+    splits = data_out.joinpath('splits')
+    x_data = data_out.joinpath('x_data')
+    y_data = data_out.joinpath('y_data')
+
+    try:
+        data_in.mkdir(exist_ok=exist_ok)
+        data_out.mkdir(exist_ok=exist_ok)
+        splits.mkdir(exist_ok=exist_ok)
+        x_data.mkdir(exist_ok=exist_ok)
+        y_data.mkdir(exist_ok=exist_ok)
+    except FileExistsError:
+        sys.exit(
+            "Some folders already exist. To overwrite contents use command-line argument '--overwrite'"
+        )
+
+
+def _check_folder(path: Union[str, PathLike, Path]) -> Path:
+    """
+    Check if the provided path exists and is a folder.
+
+    Parameters
+    ----------
+    path : Union[str, PathLike, Path]
+        The folder path to check.
+
+    Returns
+    -------
+    Path
+        The absolute Path object corresponding to the folder.
+
+    Raises
+    ------
+    TypeError
+        If the supplied argument is not a string or Path-like object.
+    OSError
+        If the path does not exist or is not a folder.
+    """
+    if not isinstance(path, (str, PathLike, Path)):
+        raise TypeError(
+            f"'path' must be of type str, PathLike or Path. Supplied argument is of type {type(path)}."
+        )
+    abs_path = Path(path).absolute() if not isinstance(path, Path) else path.absolute()
+
+    if not abs_path.is_dir():
+        raise OSError(
+            f"The defined folder path '{path}' does not exist or is not a folder."
+        )
+
+    return abs_path
+
+
+def _random_seed_list(seed_list_str: str) -> list:
+    """
+    Convert a comma-separated string of random seeds into a list of integers.
+
+    Parameters
+    ----------
+    seed_list_str : str
+        A comma-separated string (e.g., "42,17,256").
+
+    Returns
+    -------
+    list
+        List of integer seeds.
+
+    Raises
+    ------
+    TypeError
+        If the input is not a string.
+    """
+    if not isinstance(seed_list_str, str):
+        raise TypeError(
+            f"'random_seed' must be of type str. Supplied argument is of type {type(seed_list_str)}."
+        )
+    seed_list = seed_list_str.split(',')
+    return [int(item) for item in seed_list]
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,104 @@
+import unittest
+import pandas as pd
+from pathlib import Path
+from io import StringIO
+import logging
+
+# Mocking the functions we need for testing
+from unittest.mock import patch, MagicMock
+from your_script import ensure_columns, _check_folder, _random_seed_list, merge_master_tables, split_data_sets
+
+# Define a simple DataFrame for testing purposes
+sample_data = {
+    'improve_sample_id': [1, 2],
+    'improve_drug_id': ['A', 'B'],
+    'fit_auc': [0.85, 0.92],
+    'fit_ic50': [5.5, 3.2]
+}
+df_valid = pd.DataFrame(sample_data)
+
+# Define test cases
+class TestImprovedScript(unittest.TestCase):
+
+    # Test the ensure_columns function
+    def test_ensure_columns_valid(self):
+        required_columns = ['improve_sample_id', 'improve_drug_id']
+        try:
+            ensure_columns(df_valid, required_columns, context="test_data")
+        except KeyError as e:
+            self.fail(f"ensure_columns raised KeyError unexpectedly: {e}")
+
+    def test_ensure_columns_missing(self):
+        required_columns = ['missing_column']
+        with self.assertRaises(KeyError):
+            ensure_columns(df_valid, required_columns, context="test_data")
+
+    # Test _check_folder function
+    @patch("pathlib.Path.is_dir", return_value=True)
+    def test_check_folder_valid(self, mock_is_dir):
+        path = "/valid/directory"
+        result = _check_folder(path)
+        self.assertEqual(result, Path(path).absolute())
+        mock_is_dir.assert_called_once()
+
+    @patch("pathlib.Path.is_dir", return_value=False)
+    def test_check_folder_invalid(self, mock_is_dir):
+        path = "/invalid/directory"
+        with self.assertRaises(OSError):
+            _check_folder(path)
+        mock_is_dir.assert_called_once()
+
+    # Test _random_seed_list function
+    def test_random_seed_list_valid(self):
+        input_str = "1,2,3"
+        expected_output = [1, 2, 3]
+        result = _random_seed_list(input_str)
+        self.assertEqual(result, expected)
+
+    def test_random_seed_list_invalid(self):
+        input_str = "1,2,abc"
+        with self.assertRaises(ValueError):
+            _random_seed_list(input_str)
+
+    # Test merge_master_tables function (this is just a basic mock for illustration)
+    @patch("your_script.pd.concat", return_value=df_valid)
+    def test_merge_master_tables(self, mock_concat):
+        result = merge_master_tables({}, {}, 'transcriptomics')
+        self.assertTrue(result.equals(df_valid))
+        mock_concat.assert_called_once()
+
+    # Test split_data_sets function (mocking as needed)
+    @patch("your_script.tqdm")
+    @patch("your_script.pd.merge", return_value=df_valid)
+    def test_split_data_sets(self, mock_merge, mock_tqdm):
+        # Creating a dummy args object with necessary attributes
+        class Args:
+            WORKDIR = Path.cwd()
+            SPLIT_TYPE = 'mixed-set'
+            NUM_SPLITS = 2
+            RANDOM_SEEDS = None
+
+        args = Args()
+        data_sets_info = {'dataset_1': MagicMock()}
+        data_sets = {'dataset_1': MagicMock()}
+        response_data = df_valid
+        splits_folder = Path("/mock/splits")
+
+        split_data_sets(args, data_sets, data_sets_info, response_data)
+
+        # Assert that the merge function was called at least once
+        mock_merge.assert_called()
+        mock_tqdm.assert_called_once()
+
+    # Test logging for errors
+    @patch('your_script.logger.error')
+    def test_logging_error(self, mock_logger):
+        # Simulate an error in the code
+        try:
+            ensure_columns(df_valid, ['non_existent_column'], context="test_data")
+        except KeyError:
+            mock_logger.assert_called_with("Missing required columns ['non_existent_column'] in test_data")
+
+# Run the tests
+if __name__ == '__main__':
+    unittest.main()
