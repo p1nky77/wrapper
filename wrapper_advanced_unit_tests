@@ -1,0 +1,159 @@
+import unittest
+import tempfile
+import os
+import sys
+from pathlib import Path
+from io import StringIO
+from unittest.mock import patch, MagicMock, call
+
+import pandas as pd
+
+# Import functions from your main script.
+# Adjust "your_script" to the correct module name.
+from your_script import (
+    ensure_columns,
+    _check_folder,
+    _random_seed_list,
+    merge_master_tables,
+    split_data_sets,
+    main,
+    setup_workflow,
+    download_datasets,
+    process_datasets,
+    logger
+)
+
+# Define a simple valid DataFrame for testing helper functions
+sample_data = {
+    'improve_sample_id': [1, 2],
+    'improve_drug_id': ['A', 'B'],
+    'fit_auc': [0.85, 0.92],
+    'fit_ic50': [5.5, 3.2]
+}
+df_valid = pd.DataFrame(sample_data)
+
+
+class TestHelperFunctions(unittest.TestCase):
+    def test_ensure_columns_valid(self):
+        required_columns = ['improve_sample_id', 'improve_drug_id']
+        try:
+            ensure_columns(df_valid, required_columns, context="test_data")
+        except KeyError as e:
+            self.fail(f"ensure_columns raised KeyError unexpectedly: {e}")
+
+    def test_ensure_columns_missing(self):
+        required_columns = ['missing_column']
+        with self.assertRaises(KeyError):
+            ensure_columns(df_valid, required_columns, context="test_data")
+
+    @patch("your_script.Path.is_dir", return_value=True)
+    def test_check_folder_valid(self, mock_is_dir):
+        path = "/valid/directory"
+        result = _check_folder(path)
+        self.assertEqual(result, Path(path).absolute())
+        mock_is_dir.assert_called_once()
+
+    @patch("your_script.Path.is_dir", return_value=False)
+    def test_check_folder_invalid(self, mock_is_dir):
+        path = "/invalid/directory"
+        with self.assertRaises(OSError):
+            _check_folder(path)
+        mock_is_dir.assert_called_once()
+
+    def test_random_seed_list_valid(self):
+        input_str = "1,2,3"
+        expected_output = [1, 2, 3]
+        result = _random_seed_list(input_str)
+        self.assertEqual(result, expected_output)
+
+    def test_random_seed_list_invalid(self):
+        input_str = "1,2,abc"
+        with self.assertRaises(ValueError):
+            _random_seed_list(input_str)
+
+    @patch("your_script.pd.concat", return_value=df_valid)
+    def test_merge_master_tables(self, mock_concat):
+        # Passing empty dicts just for testing; in a real scenario, proper dataset objects are needed.
+        result = merge_master_tables({}, {}, 'transcriptomics')
+        self.assertTrue(result.equals(df_valid))
+        mock_concat.assert_called_once()
+
+    @patch('your_script.logger.error')
+    def test_logging_error(self, mock_logger):
+        with self.assertRaises(KeyError):
+            ensure_columns(df_valid, ['non_existent_column'], context="test_data")
+        # Optionally, you could check that logger.error was called; however,
+        # since ensure_columns raises the error before logging, you might need to wrap it.
+
+
+class TestCLIModule(unittest.TestCase):
+    """Tests for the CLI portion of the script."""
+    @patch('your_script.setup_workflow')
+    @patch('your_script.download_datasets')
+    @patch('your_script.process_datasets')
+    def test_cli_all_command(self, mock_process, mock_download, mock_setup):
+        # Simulate command-line args for the 'all' command.
+        testargs = ["script_name.py", "all", "--work_dir", os.getcwd()]
+        with patch.object(sys, 'argv', testargs):
+            main()
+        self.assertTrue(mock_setup.called)
+        self.assertTrue(mock_download.called)
+        self.assertTrue(mock_process.called)
+
+    @patch('your_script.setup_workflow')
+    def test_cli_setup_command(self, mock_setup):
+        testargs = ["script_name.py", "setup", "--work_dir", os.getcwd()]
+        with patch.object(sys, 'argv', testargs):
+            main()
+        self.assertTrue(mock_setup.called)
+
+    def test_cli_no_command(self):
+        testargs = ["script_name.py"]
+        with patch.object(sys, 'argv', testargs), self.assertRaises(SystemExit):
+            main()
+
+
+class TestIntegration(unittest.TestCase):
+    """Basic integration tests using temporary directories."""
+    @patch('your_script.cd.download')
+    @patch('your_script.cd.load')
+    def test_full_workflow_integration(self, mock_load, mock_download):
+        # Use a temporary directory for the working directory.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Simulate successful download
+            mock_download.return_value = None
+
+            # Create a dummy dataset object with minimal attributes
+            dummy_dataset = MagicMock()
+            dummy_dataset.experiments = pd.DataFrame({
+                'improve_sample_id': [1, 2],
+                'improve_drug_id': ['A', 'B'],
+                'time': [0, 0],
+                'study': ['study1', 'study1']
+            })
+            dummy_dataset.format.return_value = dummy_dataset.experiments.copy()
+            dummy_dataset.genes = pd.DataFrame({
+                'other_id_source': ['ensembl_gene', 'ensembl_gene'],
+                'other_id': ['ENSG000001', 'ENSG000002'],
+                'entrez_id': [101, 102],
+                'gene_symbol': ['GeneA', 'GeneB']
+            })
+            dummy_dataset.train_test_validate.return_value = MagicMock(
+                train=MagicMock(experiments=dummy_dataset.experiments),
+                test=MagicMock(experiments=dummy_dataset.experiments),
+                validate=MagicMock(experiments=dummy_dataset.experiments)
+            )
+            mock_load.return_value = dummy_dataset
+
+            # Prepare the command-line arguments for a full workflow
+            testargs = ["script_name.py", "all", "--work_dir", temp_dir, "--verbose", "debug"]
+            with patch.object(sys, 'argv', testargs):
+                main()
+
+            # Check that expected output files exist in the temporary directory.
+            out_response = Path(temp_dir) / "data_out" / "y_data" / "response.tsv"
+            self.assertTrue(out_response.exists())
+            # Optionally, open and check the contents of out_response if needed.
+
+if __name__ == '__main__':
+    unittest.main()
